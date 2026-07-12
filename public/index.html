@@ -326,9 +326,8 @@
       .badge { text-align: center; }
     }
 
-    /* hide rows */
-    #roomRow { display: none; }
-    #lobbyRow { display: flex; }
+    /* seat controls wrap cleanly on narrow screens */
+    #controlsRow { row-gap: 8px; }
   </style>
 </head>
 <body>
@@ -352,18 +351,16 @@
       </div>
     </div>
 
-    <div id="lobbyRow" class="row">
-      <input id="roomInput" placeholder="ROOM CODE" maxlength="6">
-      <button class="btn-brass" id="joinBtn">Join</button>
-      <button class="btn-ghost" id="createBtn">New Game</button>
-    </div>
-    <div id="roomRow" class="row">
-      <span class="room-tag">Room <b id="roomCodeDisplay"></b></span>
-      <button class="btn-ghost" id="leaveBtn">Leave Game</button>
+    <div class="row" id="controlsRow">
+      <span class="room-tag">You are <b id="seatDisplay">connecting…</b></span>
+      <button class="btn-brass" id="joinWhiteBtn" style="display:none;">Join as White</button>
+      <button class="btn-brass" id="joinBlackBtn" style="display:none;">Join as Black</button>
+      <button class="btn-ghost" id="leaveBtn" style="display:none;">Leave Seat</button>
+      <button class="btn-ghost" id="newGameBtn">New Game</button>
     </div>
 
     <div class="status-row">
-      <span class="status" id="statusText">Create a game, send code to friend.</span>
+      <span class="status" id="statusText">Connecting to the game…</span>
       <span class="badge badge-white" id="turnBadge">White to move</span>
     </div>
 
@@ -398,15 +395,16 @@
     // ---------- DOM refs ----------
     const canvas = document.getElementById('board');
     const ctx = canvas.getContext('2d');
-    const roomInput = document.getElementById('roomInput');
     const statusText = document.getElementById('statusText');
     const turnBadge = document.getElementById('turnBadge');
     const capturedWhiteEl = document.getElementById('capturedWhite');
     const capturedBlackEl = document.getElementById('capturedBlack');
     const promoOverlay = document.getElementById('promoOverlay');
-    const lobbyRow = document.getElementById('lobbyRow');
-    const roomRow = document.getElementById('roomRow');
-    const roomCodeDisplay = document.getElementById('roomCodeDisplay');
+    const seatDisplay = document.getElementById('seatDisplay');
+    const joinWhiteBtn = document.getElementById('joinWhiteBtn');
+    const joinBlackBtn = document.getElementById('joinBlackBtn');
+    const leaveBtn = document.getElementById('leaveBtn');
+    const newGameBtn = document.getElementById('newGameBtn');
     const toastEl = document.getElementById('toast');
     const soundToggle = document.getElementById('soundToggle');
     const soundStyleSel = document.getElementById('soundStyle');
@@ -416,7 +414,6 @@
     const statDraws = document.getElementById('statDraws');
     const resetStatsBtn = document.getElementById('resetStatsBtn');
 
-    let currentRoom = null;
     let myColor = null;
     let gameState = null;
     let selectedSquare = null;
@@ -433,16 +430,6 @@
     let audioCtx = null;
 
     // ---------- constants ----------
-    const initialBoard = [
-      ['r','n','b','q','k','b','n','r'],
-      ['p','p','p','p','p','p','p','p'],
-      ['','','','','','','',''],
-      ['','','','','','','',''],
-      ['','','','','','','',''],
-      ['','','','','','','',''],
-      ['P','P','P','P','P','P','P','P'],
-      ['R','N','B','Q','K','B','N','R']
-    ];
     const pieceSymbols = {
       'k':'♚','q':'♛','r':'♜','b':'♝','n':'♞','p':'♟',
       'K':'♔','Q':'♕','R':'♖','B':'♗','N':'♘','P':'♙'
@@ -451,27 +438,21 @@
     function isWhitePiece(p){ return p && p === p.toUpperCase(); }
     function isBlackPiece(p){ return p && p === p.toLowerCase(); }
     function inBounds(r,c){ return r>=0 && r<8 && c>=0 && c<8; }
+    // Self-inverse: converts logical board [row,col] <-> on-screen [row,col].
+    // Black sees the board rotated 180° so their own pieces sit at the bottom.
+    function flipCoords(r,c){ return myColor==='black' ? [7-r,7-c] : [r,c]; }
 
-    // ---------- API (mock / json) ----------
-    async function apiGetRoom(code){
+    // ---------- API (fixed single game, backed by MongoDB) ----------
+    async function apiGetGame(){
       try{
-        const res = await fetch(`/api/rooms/${code}`);
-        if (res.status===404) return null;
+        const res = await fetch('/api/game');
         if (!res.ok) return null;
         return await res.json();
       }catch(e){ return null; }
     }
-    async function apiCreateRoom(code, state){
+    async function apiUpdateGame(state, expectedLastUpdate, attempt=0){
       try{
-        const res = await fetch(`/api/rooms/${code}`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(state) });
-        if (res.status===409) return { conflict:true };
-        if (!res.ok) return null;
-        return await res.json();
-      }catch(e){ return null; }
-    }
-    async function apiUpdateRoom(code, state, expectedLastUpdate, attempt=0){
-      try{
-        const res = await fetch(`/api/rooms/${code}`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ state, expectedLastUpdate }) });
+        const res = await fetch('/api/game', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ state, expectedLastUpdate }) });
         if (res.status===409){
           const data = await res.json();
           return { conflict:true, current: data.current };
@@ -479,9 +460,16 @@
         if (!res.ok) throw new Error('bad status');
         return { conflict:false, state: await res.json() };
       }catch(e){
-        if (attempt<2){ await new Promise(r=>setTimeout(r, 350*(attempt+1))); return apiUpdateRoom(code,state,expectedLastUpdate,attempt+1); }
+        if (attempt<2){ await new Promise(r=>setTimeout(r, 350*(attempt+1))); return apiUpdateGame(state,expectedLastUpdate,attempt+1); }
         return null;
       }
+    }
+    async function apiResetGame(){
+      try{
+        const res = await fetch('/api/game/reset', { method:'POST' });
+        if (!res.ok) return null;
+        return await res.json();
+      }catch(e){ return null; }
     }
 
     // ---------- local storage ----------
@@ -605,8 +593,8 @@
 
     function maybeRecordResult(state){
       if(!['checkmate','stalemate','draw'].includes(state.status)) return;
-      if(!myColor || !currentRoom) return;
-      const id=currentRoom+':'+state.lastUpdate;
+      if(!myColor) return;
+      const id='mychess:'+state.lastUpdate;
       if(recordedGames.includes(id)) return;
       recordedGames.push(id); if(recordedGames.length>100) recordedGames=recordedGames.slice(-100);
       localSet('chess-recorded', JSON.stringify(recordedGames));
@@ -614,70 +602,127 @@
       saveStats(); renderStats();
     }
 
-    // ---------- room management ----------
-    function freshState(){ return { board:JSON.parse(JSON.stringify(initialBoard)), turn:'white', whiteId:null, blackId:null, castling:{wK:true,wQ:true,bK:true,bQ:true}, enPassant:null, halfmoveClock:0, captured:{white:[],black:[]}, status:'playing', winner:null, lastUpdate:Date.now() }; }
-    function setInRoomUI(inRoom){ lobbyRow.style.display=inRoom?'none':'flex'; roomRow.style.display=inRoom?'flex':'none'; if(inRoom) roomCodeDisplay.textContent=currentRoom; }
-
-    async function createRoom(){
-      ensureAudio();
-      const code=Math.random().toString(36).substring(2,6).toUpperCase();
-      const state=freshState(); state.whiteId=myClientId;
-      const result=await apiCreateRoom(code,state);
-      if(!result || result.conflict){ statusText.textContent='Could not create room, try again.'; return; }
-      myColor='white'; currentRoom=code; gameState=result; setInRoomUI(true);
-      statusText.textContent=`Room ${code} created — you're White. Send code.`;
-      localSet('chess-active-room', JSON.stringify({room:code}));
-      startPolling(); drawBoard(); updateUI();
+    // ---------- seat management (single fixed game, no room codes) ----------
+    function updateSeatUI(){
+      const state=gameState;
+      if(myColor){
+        seatDisplay.textContent=myColor==='white'?'White':'Black';
+        joinWhiteBtn.style.display='none';
+        joinBlackBtn.style.display='none';
+        leaveBtn.style.display='inline-flex';
+      } else {
+        seatDisplay.textContent='spectating';
+        leaveBtn.style.display='none';
+        const whiteOpen=!state || !state.whiteId;
+        const blackOpen=!state || !state.blackId;
+        joinWhiteBtn.style.display=whiteOpen?'inline-flex':'none';
+        joinBlackBtn.style.display=blackOpen?'inline-flex':'none';
+      }
     }
-    async function joinRoom(){
-      ensureAudio();
-      const code=roomInput.value.trim().toUpperCase();
-      if(!code){ statusText.textContent='Enter a room code first.'; return; }
-      const state=await apiGetRoom(code);
-      if(!state){ statusText.textContent='No game found with that code.'; return; }
+
+    async function loadGame(){
+      const state=await apiGetGame();
+      if(!state){ statusText.textContent='Could not reach the game server.'; return; }
+      gameState=state;
       if(state.whiteId===myClientId) myColor='white';
       else if(state.blackId===myClientId) myColor='black';
-      else if(!state.blackId){ const upd=await apiUpdateRoom(code,{...state,blackId:myClientId},state.lastUpdate); if(upd&&!upd.conflict){ gameState=upd.state; myColor='black'; } else { myColor='black'; gameState=state; } }
-      else if(!state.whiteId){ const upd=await apiUpdateRoom(code,{...state,whiteId:myClientId},state.lastUpdate); if(upd&&!upd.conflict){ gameState=upd.state; myColor='white'; } else { myColor='white'; gameState=state; } }
-      else { myColor=null; }
-      currentRoom=code; if(!gameState) gameState=state; setInRoomUI(true);
-      statusText.textContent=myColor?`Joined as ${myColor}.`:'Both seats full — watching.';
-      if(myColor) localSet('chess-active-room', JSON.stringify({room:code}));
-      startPolling(); drawBoard(); updateUI();
+      else myColor=null;
+      statusText.textContent=myColor?`Welcome back — you're ${myColor}.`:'Join as White or Black to play.';
+      updateSeatUI(); drawBoard(); updateUI(); connectWS(); startPolling();
     }
-    function leaveRoom(){
-      if(pollTimer) clearInterval(pollTimer); pollTimer=null;
-      currentRoom=null; myColor=null; gameState=null; selectedSquare=null; legalMoves=[];
-      localDel('chess-active-room'); setInRoomUI(false);
-      roomInput.value='';
-      statusText.textContent='Create a game, send code to friend.';
+
+    async function joinSeat(color){
+      ensureAudio();
+      const state=gameState || await apiGetGame();
+      if(!state){ statusText.textContent='Could not reach the game server.'; return; }
+      const key=color==='white'?'whiteId':'blackId';
+      if(state[key] && state[key]!==myClientId){
+        gameState=state; updateSeatUI(); drawBoard(); updateUI();
+        statusText.textContent=`${color==='white'?'White':'Black'} seat is already taken.`;
+        return;
+      }
+      const updated={ ...state, [key]: myClientId };
+      const result=await apiUpdateGame(updated, state.lastUpdate);
+      if(result && !result.conflict && result.state){
+        gameState=result.state; myColor=color;
+        statusText.textContent=`Joined as ${color}.`;
+      } else {
+        const fresh=await apiGetGame();
+        if(fresh) gameState=fresh;
+        if(fresh && fresh[key]===myClientId){ myColor=color; statusText.textContent=`Joined as ${color}.`; }
+        else { statusText.textContent=`Couldn't claim ${color==='white'?'White':'Black'} — try again.`; }
+      }
+      updateSeatUI(); drawBoard(); updateUI();
+    }
+
+    async function leaveSeat(){
+      if(!myColor || !gameState) return;
+      const key=myColor==='white'?'whiteId':'blackId';
+      const updated={ ...gameState, [key]: null };
+      const result=await apiUpdateGame(updated, gameState.lastUpdate);
+      if(result && !result.conflict && result.state) gameState=result.state;
+      else { const fresh=await apiGetGame(); if(fresh) gameState=fresh; }
+      myColor=null; selectedSquare=null; legalMoves=[];
+      statusText.textContent='You left your seat — spectating.';
+      updateSeatUI(); drawBoard(); updateUI();
+    }
+
+    async function newGame(){
+      if(!confirm('Start a new game? This resets the board for everyone.')) return;
+      const fresh=await apiResetGame();
+      if(!fresh){ statusText.textContent='Could not reset the game — try again.'; return; }
+      gameState=fresh; myColor=null; selectedSquare=null; legalMoves=[];
+      statusText.textContent='New game started — join a seat to play.';
       turnBadge.textContent='White to move'; turnBadge.className='badge badge-white';
-      capturedWhiteEl.textContent=''; capturedBlackEl.textContent='';
-      drawBoard();
+      updateSeatUI(); drawBoard(); updateUI();
     }
-    async function tryAutoResume(){
-      const raw=localGet('chess-active-room'); if(!raw) return;
-      let parsed; try{ parsed=JSON.parse(raw); }catch(e){ return; }
-      if(!parsed||!parsed.room) return;
-      const state=await apiGetRoom(parsed.room);
-      if(!state || (state.whiteId!==myClientId && state.blackId!==myClientId)){ localDel('chess-active-room'); return; }
-      currentRoom=parsed.room; myColor=state.whiteId===myClientId?'white':'black'; gameState=state;
-      setInRoomUI(true); statusText.textContent=`Reconnected to room ${currentRoom}.`;
-      startPolling(); drawBoard(); updateUI();
+
+    function applyIncomingState(fresh){
+      if(!fresh) return;
+      if(fresh.lastUpdate===(gameState&&gameState.lastUpdate)) return;
+      const isNewMove=gameState && fresh.lastUpdate>gameState.lastUpdate;
+      gameState=fresh; selectedSquare=null; legalMoves=[];
+      if(myColor==='white' && fresh.whiteId!==myClientId) myColor=null;
+      if(myColor==='black' && fresh.blackId!==myClientId) myColor=null;
+      updateSeatUI(); drawBoard(); updateUI();
+      if(isNewMove) playSound(settings.soundStyle);
+      maybeRecordResult(fresh);
     }
+
+    // ---------- realtime (WebSocket, instant move sync) ----------
+    let ws=null;
+    let wsReconnectTimer=null;
+    function connectWS(){
+      try{
+        const protocol=location.protocol==='https:'?'wss:':'ws:';
+        ws=new WebSocket(`${protocol}//${location.host}`);
+        ws.addEventListener('open', ()=>{
+          if(wsReconnectTimer){ clearTimeout(wsReconnectTimer); wsReconnectTimer=null; }
+        });
+        ws.addEventListener('message', (event)=>{
+          try{
+            const msg=JSON.parse(event.data);
+            if(msg.type==='state' && msg.state) applyIncomingState(msg.state);
+          }catch(e){}
+        });
+        ws.addEventListener('close', scheduleWSReconnect);
+        ws.addEventListener('error', ()=>{ try{ ws.close(); }catch(e){} });
+      }catch(e){ scheduleWSReconnect(); }
+    }
+    function scheduleWSReconnect(){
+      if(wsReconnectTimer) return;
+      wsReconnectTimer=setTimeout(()=>{ wsReconnectTimer=null; connectWS(); }, 1500);
+    }
+
+    // Slow fallback poll — WebSocket handles instant sync, this just guards
+    // against a dropped/missed connection so the board never drifts for long.
     function startPolling(){
       if(pollTimer) clearInterval(pollTimer);
       pollTimer=setInterval(async ()=>{
-        if(!currentRoom || saveInFlight) return;
-        const fresh=await apiGetRoom(currentRoom);
-        if(fresh && fresh.lastUpdate!==(gameState&&gameState.lastUpdate)){
-          const isNewMove=gameState && fresh.lastUpdate>gameState.lastUpdate;
-          gameState=fresh; selectedSquare=null; legalMoves=[];
-          drawBoard(); updateUI();
-          if(isNewMove) playSound(settings.soundStyle);
-          maybeRecordResult(fresh);
-        }
-      }, 1200);
+        if(saveInFlight) return;
+        const fresh=await apiGetGame();
+        applyIncomingState(fresh);
+      }, 4000);
     }
 
     // ---------- move execution ----------
@@ -689,7 +734,7 @@
     });
 
     async function finalizeMove(move,promoteTo){
-      if(!currentRoom||!gameState||!myColor) return;
+      if(!gameState||!myColor) return;
       ensureAudio();
       const board=gameState.board;
       const piece=board[move.from[0]][move.from[1]];
@@ -717,12 +762,31 @@
       else if(halfmoveClock>=100){ status='draw'; }
       else if(nextInCheck){ status='check'; }
       const prevLastUpdate=gameState.lastUpdate;
+      const prevState=gameState;
       const newState={...tempState, status, winner, lastUpdate:Date.now()};
       gameState=newState; selectedSquare=null; legalMoves=[];
       drawBoard(); updateUI(); maybeRecordResult(newState);
       saveInFlight=true;
-      const result=await apiUpdateRoom(currentRoom,newState,prevLastUpdate);
-      if(result && !result.conflict && result.state) gameState=result.state;
+      const result=await apiUpdateGame(newState,prevLastUpdate);
+      if(result && !result.conflict && result.state){
+        gameState=result.state; drawBoard(); updateUI();
+      } else if(result && result.conflict){
+        // Someone else's update landed first — pull the authoritative state
+        // instead of leaving our un-saved move on screen.
+        const authoritative = result.current || await apiGetGame();
+        if(authoritative){ gameState=authoritative; }
+        else { gameState=prevState; }
+        selectedSquare=null; legalMoves=[];
+        drawBoard(); updateUI();
+        showToast('Move didn\'t save — board updated to the latest state.');
+      } else {
+        // Total failure (offline / server unreachable after retries) — roll back
+        // the optimistic move rather than letting it silently vanish later.
+        gameState=prevState; selectedSquare=null; legalMoves=[];
+        drawBoard(); updateUI();
+        statusText.textContent='Move failed to save — check your connection and try again.';
+        showToast('Move not saved — connection issue.');
+      }
       saveInFlight=false;
     }
 
@@ -731,11 +795,28 @@
     function drawBoard(){
       const size=480, sq=size/8;
       ctx.clearRect(0,0,size,size);
-      for(let r=0;r<8;r++){ for(let c=0;c<8;c++){ const light=(r+c)%2===0; ctx.fillStyle=light?getCss('--board-light'):getCss('--board-dark'); ctx.fillRect(c*sq,r*sq,sq,sq); if(selectedSquare&&selectedSquare[0]===r&&selectedSquare[1]===c){ ctx.fillStyle='rgba(201,162,75,0.5)'; ctx.fillRect(c*sq,r*sq,sq,sq); } if(legalMoves.some(m=>m.to[0]===r&&m.to[1]===c)){ ctx.fillStyle='rgba(60,120,70,0.4)'; ctx.fillRect(c*sq,r*sq,sq,sq); } } }
+      for(let dr=0;dr<8;dr++){ for(let dc=0;dc<8;dc++){
+        const [r,c]=flipCoords(dr,dc);
+        const light=(dr+dc)%2===0;
+        ctx.fillStyle=light?getCss('--board-light'):getCss('--board-dark'); ctx.fillRect(dc*sq,dr*sq,sq,sq);
+        if(selectedSquare&&selectedSquare[0]===r&&selectedSquare[1]===c){ ctx.fillStyle='rgba(201,162,75,0.5)'; ctx.fillRect(dc*sq,dr*sq,sq,sq); }
+        if(legalMoves.some(m=>m.to[0]===r&&m.to[1]===c)){ ctx.fillStyle='rgba(60,120,70,0.4)'; ctx.fillRect(dc*sq,dr*sq,sq,sq); }
+      } }
       if(!gameState) return;
-      if(gameState.status==='check'||gameState.status==='checkmate'){ const kp=findKing(gameState.board,gameState.turn==='white'); if(kp){ ctx.fillStyle='rgba(184,80,59,0.5)'; ctx.fillRect(kp[1]*sq,kp[0]*sq,sq,sq); } }
+      if(gameState.status==='check'||gameState.status==='checkmate'){
+        const kp=findKing(gameState.board,gameState.turn==='white');
+        if(kp){ const [kdr,kdc]=flipCoords(kp[0],kp[1]); ctx.fillStyle='rgba(184,80,59,0.5)'; ctx.fillRect(kdc*sq,kdr*sq,sq,sq); }
+      }
       const board=gameState.board;
-      for(let r=0;r<8;r++){ for(let c=0;c<8;c++){ const p=board[r][c]; if(!p) continue; const isWhite=isWhitePiece(p); ctx.font=`${sq*0.68}px "Segoe UI Symbol","Apple Color Emoji",sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle'; const x=c*sq+sq/2, y=r*sq+sq/2+2; ctx.lineJoin='round'; ctx.miterLimit=2; ctx.lineWidth=sq*0.09; ctx.strokeStyle=isWhite?'#1c140d':'#f7f1e3'; ctx.strokeText(pieceSymbols[p], x, y); ctx.fillStyle=isWhite?'#fffdf7':'#1c140d'; ctx.fillText(pieceSymbols[p], x, y); } }
+      for(let dr=0;dr<8;dr++){ for(let dc=0;dc<8;dc++){
+        const [r,c]=flipCoords(dr,dc);
+        const p=board[r][c]; if(!p) continue; const isWhite=isWhitePiece(p);
+        ctx.font=`${sq*0.68}px "Segoe UI Symbol","Apple Color Emoji",sans-serif`; ctx.textAlign='center'; ctx.textBaseline='middle';
+        const x=dc*sq+sq/2, y=dr*sq+sq/2+2;
+        ctx.lineJoin='round'; ctx.miterLimit=2; ctx.lineWidth=sq*0.09;
+        ctx.strokeStyle=isWhite?'#1c140d':'#f7f1e3'; ctx.strokeText(pieceSymbols[p], x, y);
+        ctx.fillStyle=isWhite?'#fffdf7':'#1c140d'; ctx.fillText(pieceSymbols[p], x, y);
+      } }
     }
     function updateUI(){
       if(!gameState){ turnBadge.textContent='—'; return; }
@@ -756,8 +837,9 @@
       const rect=canvas.getBoundingClientRect();
       const scaleX=480/rect.width, scaleY=480/rect.height;
       const x=(clientX-rect.left)*scaleX, y=(clientY-rect.top)*scaleY;
-      const col=Math.floor(x/60), row=Math.floor(y/60);
-      if(row<0||row>7||col<0||col>7) return;
+      const dcol=Math.floor(x/60), drow=Math.floor(y/60);
+      if(drow<0||drow>7||dcol<0||dcol>7) return;
+      const [row,col]=flipCoords(drow,dcol);
       const board=gameState.board; const clicked=board[row][col];
       if(selectedSquare){ const match=legalMoves.find(m=>m.to[0]===row&&m.to[1]===col); if(match){ if(match.flag==='promotion') openPromotionModal(match); else finalizeMove(match,null); return; } }
       selectedSquare=null; legalMoves=[];
@@ -770,9 +852,10 @@
     canvas.addEventListener('click',(e)=>handleBoardPoint(e.clientX,e.clientY));
     canvas.addEventListener('touchend',(e)=>{ if(e.changedTouches&&e.changedTouches[0]){ e.preventDefault(); handleBoardPoint(e.changedTouches[0].clientX,e.changedTouches[0].clientY); } }, {passive:false});
 
-    document.getElementById('createBtn').addEventListener('click', createRoom);
-    document.getElementById('joinBtn').addEventListener('click', joinRoom);
-    document.getElementById('leaveBtn').addEventListener('click', leaveRoom);
+    joinWhiteBtn.addEventListener('click', ()=>joinSeat('white'));
+    joinBlackBtn.addEventListener('click', ()=>joinSeat('black'));
+    leaveBtn.addEventListener('click', leaveSeat);
+    newGameBtn.addEventListener('click', newGame);
 
     // ---------- init ----------
     function init(){
@@ -784,7 +867,7 @@
       const rawStats=localGet('chess-stats'); if(rawStats){ try{ stats={...stats,...JSON.parse(rawStats)}; }catch(e){} }
       renderStats();
       const rawRecorded=localGet('chess-recorded'); if(rawRecorded){ try{ recordedGames=JSON.parse(rawRecorded)||[]; }catch(e){} }
-      tryAutoResume();
+      loadGame();
     }
     init();
   })();

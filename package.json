@@ -1,8 +1,8 @@
 {
   "name": "two-square-chess",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Real-time two-player chess backed by a JSON file database.",
+  "description": "Real-time two-player chess backed by MongoDB, always played in one fixed game (\"mychess\").",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,6 +11,8 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "mongodb": "^6.8.0",
+    "ws": "^8.18.0"
   }
 }
